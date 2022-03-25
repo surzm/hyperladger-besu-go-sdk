@@ -19,6 +19,7 @@ package types
 import (
 	"bytes"
 	"errors"
+	"github.com/ethereum/go-ethereum/crypto"
 	"io"
 	"math/big"
 	"sync/atomic"
@@ -30,10 +31,11 @@ import (
 )
 
 var (
-	ErrInvalidSig         = errors.New("invalid transaction v, r, s values")
-	ErrTxTypeNotSupported = errors.New("transaction type not supported")
-	ErrGasFeeCapTooLow    = errors.New("fee cap less than base fee")
-	errEmptyTypedTx       = errors.New("empty typed transaction bytes")
+	ErrInvalidSig           = errors.New("invalid transaction v, r, s values")
+	ErrUnexpectedProtection = errors.New("transaction type does not supported EIP-155 protected signatures")
+	ErrTxTypeNotSupported   = errors.New("transaction type not supported")
+	ErrGasFeeCapTooLow      = errors.New("fee cap less than base fee")
+	errEmptyTypedTx         = errors.New("empty typed transaction bytes")
 )
 
 // Transaction types.
@@ -466,6 +468,45 @@ type Message struct {
 	isFake     bool
 }
 
+func NewMessage(from common.Address, to *common.Address, nonce uint64, amount *big.Int, gasLimit uint64, gasPrice, gasFeeCap, gasTipCap *big.Int, data []byte, accessList AccessList, isFake bool) Message {
+	return Message{
+		from:       from,
+		to:         to,
+		nonce:      nonce,
+		amount:     amount,
+		gasLimit:   gasLimit,
+		gasPrice:   gasPrice,
+		gasFeeCap:  gasFeeCap,
+		gasTipCap:  gasTipCap,
+		data:       data,
+		accessList: accessList,
+		isFake:     isFake,
+	}
+}
+
+// AsMessage returns the transaction as a core.Message.
+func (tx *Transaction) AsMessage(s Signer, baseFee *big.Int) (Message, error) {
+	msg := Message{
+		nonce:      tx.Nonce(),
+		gasLimit:   tx.Gas(),
+		gasPrice:   new(big.Int).Set(tx.GasPrice()),
+		gasFeeCap:  new(big.Int).Set(tx.GasFeeCap()),
+		gasTipCap:  new(big.Int).Set(tx.GasTipCap()),
+		to:         tx.To(),
+		amount:     tx.Value(),
+		data:       tx.Data(),
+		accessList: tx.AccessList(),
+		isFake:     false,
+	}
+	// If baseFee provided, set gasPrice to effectiveGasPrice.
+	if baseFee != nil {
+		msg.gasPrice = math.BigMin(msg.gasPrice.Add(msg.gasTipCap, baseFee), msg.gasFeeCap)
+	}
+	var err error
+	msg.from, err = Sender(s, tx)
+	return msg, err
+}
+
 func (m Message) From() common.Address   { return m.from }
 func (m Message) To() *common.Address    { return m.to }
 func (m Message) GasPrice() *big.Int     { return m.gasPrice }
@@ -485,4 +526,30 @@ func copyAddressPtr(a *common.Address) *common.Address {
 	}
 	cpy := *a
 	return &cpy
+}
+
+func sanityCheckSignature(v *big.Int, r *big.Int, s *big.Int, maybeProtected bool) error {
+	if isProtectedV(v) && !maybeProtected {
+		return ErrUnexpectedProtection
+	}
+
+	var plainV byte
+	if isProtectedV(v) {
+		chainID := deriveChainId(v).Uint64()
+		plainV = byte(v.Uint64() - 35 - 2*chainID)
+	} else if maybeProtected {
+		// Only EIP-155 signatures can be optionally protected. Since
+		// we determined this v value is not protected, it must be a
+		// raw 27 or 28.
+		plainV = byte(v.Uint64() - 27)
+	} else {
+		// If the signature is not optionally protected, we assume it
+		// must already be equal to the recovery id.
+		plainV = byte(v.Uint64())
+	}
+	if !crypto.ValidateSignatureValues(plainV, r, s, false) {
+		return ErrInvalidSig
+	}
+
+	return nil
 }
